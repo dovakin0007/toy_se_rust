@@ -1,13 +1,13 @@
 mod model;
 
 use std::cmp::Ordering;
-use std::str;
+use std::str::{self, FromStr};
 use std::fs::{ File, read_dir};
 use std::path::Path;
 use std::process::{ExitCode, exit};
 use xml::reader::{EventReader, XmlEvent::Characters};
 use std::result::Result;
-use tiny_http::{Server, Response, Request, Method};
+use tiny_http::{Server, Response, Request, Method, Header};
 use model::*;
 
 fn _read_index_file(index_path: &str) -> Result<(), ()>{
@@ -78,8 +78,6 @@ fn tf_index_of_folder(dir_path: &Path, tf_index:&mut TermFreqIndex) -> Result<()
 
         println!("Indexing {:?}...",&file_path);
 
-
-
         let content = match  read_xml_file(&file_path){
            Ok(content) => content.chars().collect::<Vec<_>>(),
             _ => continue 'next_file 
@@ -130,12 +128,60 @@ pub fn server_static_file_request(request: Request, file_path:&str, content_type
     Ok(())
 } 
 
+pub fn search_query<'a>(buffer: &'a str, tf_index: &'a TermFreqIndex) -> Vec<(&'a Path, f32)>{
+    let mut relevant_doc: Vec<(&Path, f32)> = Vec::new();
+
+    for (path, tf_table) in tf_index {
+        let mut rank:f32 = 0f32;
+        for token in Lexer::new(&buffer.chars().collect::<Vec<_>>()) {
+            rank += tf(&token, tf_table) * idf(&token, tf_index);
+        }
+        relevant_doc.push((path, rank));
+    }
+    relevant_doc.sort_by(|(_, a ), (_, b)|
+    {
+        match (a.is_nan(), b.is_nan()) {
+            (true, false) => Ordering::Less,   // a is NaN
+            (false, true) => Ordering::Greater, // b is NaN
+            (true, true) => Ordering::Equal,    // both are NaN (consider them equal)
+            _ => a.partial_cmp(b).unwrap(),    // compare non-NaN values
+        }
+    }
+    );
+    relevant_doc.reverse();
+    return relevant_doc;
+
+}
+
+pub fn get_response(mut request: Request, tf_index: &TermFreqIndex) -> Result<(), ()>{
+    let mut buf = Vec::new();
+            let _ = request.as_reader().read_to_end(&mut buf);
+            let buffer = String::from_utf8( buf).unwrap();
+            // println!("Body: {}", buffer.clone());
+
+            let result = search_query(&buffer, tf_index);
+            
+            // for (path, tf) in result {
+            //     println!("{path:?} => {tf}");
+            // }
+
+            let res =serde_json::to_string(&result.iter().take(20).collect::<Vec<_>>()).map_err(|e|{
+                eprintln!("ERROR: could not convert search results to JSON: {e}")
+            })?;
+            request.respond(Response::from_string(res).with_header(Header::from_str("Content-Type: application/json").unwrap())).map_err(|err|{
+                eprintln!("unable to send response : {err}")
+            })?;
+    Ok(())
+
+}
+
 fn tf(term: &str, doc: &TermFreq) -> f32 {
     let term_ap = (doc.get(term).cloned().unwrap_or(0)) as f32;
     let total_sum = (doc.clone().into_values().map(|v| v).sum::<usize>()) as f32;
 
     (term_ap/total_sum) as f32
 }
+
 
 fn idf(term: &str, d: &TermFreqIndex) -> f32 {
     let n = d.len() as f32;
@@ -150,36 +196,7 @@ pub fn serve_request(tf_index: &TermFreqIndex,mut request: Request) -> Result<()
 
     match (request.method(), request.url()) {
         (Method::Post, "/api/search") => {
-            let mut buf = Vec::new();
-            let _ = request.as_reader().read_to_end(&mut buf);
-            let buffer = String::from_utf8( buf).unwrap();
-            // println!("Body: {}", buffer.clone());
-
-            let mut relevant_doc: Vec<(&Path, f32)> = Vec::new();
-
-            for (path, tf_table) in tf_index {
-                let mut rank:f32 = 0f32;
-                for token in Lexer::new(&buffer.chars().collect::<Vec<_>>()) {
-                    rank += tf(&token, tf_table) * idf(&token, tf_index);
-                }
-                relevant_doc.push((path, rank));
-            }
-            relevant_doc.sort_by(|(_, a ), (_, b)|
-            {
-                match (a.is_nan(), b.is_nan()) {
-                    (true, false) => Ordering::Less,   // a is NaN
-                    (false, true) => Ordering::Greater, // b is NaN
-                    (true, true) => Ordering::Equal,    // both are NaN (consider them equal)
-                    _ => a.partial_cmp(b).unwrap(),    // compare non-NaN values
-                }
-            }
-            );
-            relevant_doc.reverse();
-            
-            for (path, tf) in relevant_doc {
-                println!("{path:?} => {tf}");
-            }
-            request.respond(Response::from_string("Ok")).unwrap();
+            get_response(request, tf_index).unwrap()
         }
         (Method::Get, "/index.js") => { 
             server_static_file_request(request, "index.js",  "Content-Type: text/javascript; charset=utf-8").unwrap()  
